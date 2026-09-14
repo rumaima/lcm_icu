@@ -1,0 +1,461 @@
+"""
+Experiment 3: padding control. Length vs content.
+
+For each stay, the clinical content is FROZEN at the 2k-token version from
+the truncation ladder. The input is then inflated to 4k / 8k / 16k total
+event tokens with clinically plausible but irrelevant filler: serialized
+chartevent lines drawn from OTHER stays in the cohort. Two placements:
+
+  after  : [patient record] [filler] [question]
+  before : [filler] [patient record] [question]
+
+The same filler text is used for both placements at a given budget, and
+larger fillers strictly contain smaller ones, so across all 7 conditions
+(baseline + 3 budgets x 2 placements) the decision-relevant content is
+identical and only length and position vary.
+
+The filler block is introduced with a header marking it as documentation
+not specific to this patient. This is deliberate: it makes the filler
+identifiable-in-principle as irrelevant. If it were unlabeled, other
+patients' vitals could be mistaken for the patient's own, and a performance
+drop could be blamed on genuine ambiguity, which is a content confound.
+With the label, an ideal reader is unaffected, and any drop is attributable
+to length and position alone.
+
+Cohort: identical to Experiments 1 and 2 (same JSONL, --seed, --n-samples,
+stratified subsampling, same events cache).
+
+Outputs (in --out):
+  predictions.csv        stay x condition: p_death, label, tokens
+  auroc_by_condition.csv AUROC + paired-bootstrap CI, delta vs baseline
+  positional_effect.txt  before-minus-after AUROC per budget
+  padding.png            AUROC vs total budget, one line per placement
+
+Example:
+  python exp3_padding_control.py \
+      --chartevents /path/mimic-iv-1.0/icu/chartevents.csv \
+      --d-items     /path/mimic-iv-1.0/icu/d_items.csv \
+      --icustays    /path/mimic-iv-1.0/icu/icustays.csv \
+      --jsonl       splits/train.jsonl \
+      --events-cache exp1_out/cohort_events.parquet \
+      --out exp3_out
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+DEFAULT_PAD_BUDGETS = [4000, 8000, 16000]
+
+SYSTEM_PROMPT = (
+    "You are a critical care physician. Based on the ICU record provided, "
+    "assess the risk of in-hospital mortality for this patient."
+)
+QUESTION = (
+    "\n\nBased on the record above, will this patient die during this "
+    "hospital admission? Answer with exactly one word, Yes or No.\nAnswer:"
+)
+FILLER_HEADER = (
+    "ADDITIONAL UNIT DOCUMENTATION (routine records from other patients "
+    "on the unit, not specific to this patient):\n"
+)
+
+
+def budget_tag(b):
+    """4000 -> '4k', 500 -> '500'. Used in condition names and plot ticks."""
+    return f"{b // 1000}k" if b % 1000 == 0 else str(b)
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    io = p.add_argument_group("inputs / outputs")
+    io.add_argument("--chartevents", type=Path, required=True,
+                    help="path to icu/chartevents.csv[.gz]")
+    io.add_argument("--d-items", type=Path, required=True,
+                    help="path to icu/d_items.csv[.gz] (itemid -> label)")
+    io.add_argument("--icustays", type=Path, required=True,
+                    help="path to icu/icustays.csv[.gz]")
+    io.add_argument("--stays", type=Path, default=None,
+                    help="optional txt file with one stay_id per line "
+                         "(takes precedence over --jsonl for cohort selection)")
+    io.add_argument("--jsonl", type=Path, nargs="+", default=None,
+                    help="extraction JSONL file(s): cohort, patient summaries, "
+                         "and labels")
+    io.add_argument("--events-cache", type=Path,
+                    default=Path("exp1_out/cohort_events.parquet"),
+                    help="parquet cache of cohort chartevents, shared with "
+                         "Exp1/Exp2 (default: exp1_out/cohort_events.parquet)")
+    io.add_argument("--out", type=Path, default=Path("exp3_out"),
+                    help="output directory (default: exp3_out)")
+
+    mdl = p.add_argument_group("model")
+    mdl.add_argument("--model", dest="model_name",
+                     default="Qwen/Qwen2.5-VL-7B-Instruct",
+                     help="HF model name or local path "
+                          "(default: Qwen/Qwen2.5-VL-7B-Instruct)")
+
+    smp = p.add_argument_group("cohort")
+    smp.add_argument("--n-samples", type=int, default=-1,
+                     help="subsample cohort to this many stays; "
+                          "use 0 or a negative value for all (default: -1)")
+    smp.add_argument("--seed", type=int, default=42,
+                     help="RNG seed for subsampling, filler, and bootstrap "
+                          "(default: 42)")
+    smp.add_argument("--label-key", default="in_hospital_mortality_48hr",
+                     help="key under 'labels' in the JSONL "
+                          "(default: in_hospital_mortality_48hr)")
+    smp.add_argument("--chunksize", type=int, default=5_000_000,
+                     help="rows per chunk when streaming chartevents "
+                          "(default: 5000000)")
+
+    exp = p.add_argument_group("experiment")
+    exp.add_argument("--prediction-hours", type=float, default=48.0,
+                     help="only data before this hour feeds the model "
+                          "(default: 48)")
+    exp.add_argument("--base-budget", type=int, default=2000,
+                     help="frozen clinical content, in event tokens "
+                          "(default: 2000)")
+    exp.add_argument("--pad-budgets", type=int, nargs="+",
+                     default=DEFAULT_PAD_BUDGETS,
+                     help="total event tokens after padding (default: "
+                          f"{' '.join(map(str, DEFAULT_PAD_BUDGETS))})")
+    exp.add_argument("--n-bootstrap", type=int, default=1000,
+                     help="paired bootstrap resamples (default: 1000)")
+
+    args = p.parse_args(argv)
+    if args.n_samples is not None and args.n_samples <= 0:
+        args.n_samples = None
+    args.pad_budgets = sorted(set(args.pad_budgets))
+    if args.pad_budgets and min(args.pad_budgets) <= args.base_budget:
+        p.error("every --pad-budgets value must exceed --base-budget "
+                f"({args.base_budget})")
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Cohort and events (identical logic to Experiment 2)
+# ---------------------------------------------------------------------------
+
+def load_jsonl_stays(args):
+    stays = {}
+    for path in args.jsonl or []:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    s = json.loads(line)
+                    stays[s["stay_id"]] = s
+    return stays
+
+
+def load_cohort(args, jsonl_stays):
+    if args.stays:
+        return set(int(x) for x in Path(args.stays).read_text().split())
+    wanted = set(jsonl_stays)
+    labels = {sid: s.get("labels", {}).get(args.label_key)
+              for sid, s in jsonl_stays.items()}
+    if args.n_samples is not None and len(wanted) > args.n_samples:
+        rng = np.random.default_rng(args.seed)
+        pos = sorted(s for s in wanted if labels.get(s) == 1)
+        neg = sorted(s for s in wanted if labels.get(s) == 0)
+        n_pos = min(round(args.n_samples * len(pos) / len(wanted)), len(pos))
+        keep = (list(rng.choice(pos, size=n_pos, replace=False)) +
+                list(rng.choice(neg, size=args.n_samples - n_pos,
+                                replace=False)))
+        wanted = set(int(s) for s in keep)
+        print(f"Cohort: {len(wanted)} stays "
+              f"({sum(labels[s] for s in wanted)} positive), seed={args.seed}")
+    return wanted
+
+
+def get_events(args, wanted):
+    cache = Path(args.events_cache)
+    if cache.exists():
+        print(f"Loading cached events from {cache}")
+        ev = pd.read_parquet(cache)
+        ev = ev[ev["stay_id"].isin(wanted)]
+        if set(ev["stay_id"]) >= wanted:
+            return ev
+        print("Cache is missing some cohort stays, re-streaming.")
+    keep_cols = ["stay_id", "charttime", "itemid", "value", "valuenum"]
+    parts, n_seen = [], 0
+    for chunk in pd.read_csv(args.chartevents, usecols=keep_cols,
+                             chunksize=args.chunksize,
+                             dtype={"stay_id": "int64", "itemid": "int64",
+                                    "value": "string"}, low_memory=False):
+        n_seen += len(chunk)
+        part = chunk[chunk["stay_id"].isin(wanted)]
+        if len(part):
+            parts.append(part)
+        print(f"  scanned {n_seen/1e6:.0f}M rows")
+    ev = pd.concat(parts, ignore_index=True)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    ev.to_parquet(cache)
+    return ev
+
+
+def serialize_lines(g, labels_map):
+    lines = []
+    for t, grp in g.groupby("hours", sort=True):
+        obs = []
+        for _, r in grp.iterrows():
+            name = labels_map.get(r["itemid"], f"item{r['itemid']}")
+            val = r["valuenum"] if pd.notna(r["valuenum"]) else r["value"]
+            if pd.isna(val):
+                continue
+            obs.append(f"{name}: {val}")
+        if obs:
+            lines.append(f"[{t:.2f}h] " + "; ".join(obs))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Model scoring (identical to Experiment 2)
+# ---------------------------------------------------------------------------
+
+def load_model(model_name):
+    import torch
+    from transformers import AutoProcessor, AutoTokenizer
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    print(f"Loading {model_name} ...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="auto")
+    model.eval()
+    processor = AutoProcessor.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    yes_id = tokenizer.encode("Yes", add_special_tokens=False)[0]
+    no_id = tokenizer.encode("No", add_special_tokens=False)[0]
+    return model, processor, tokenizer, yes_id, no_id
+
+
+def score_mortality(model, processor, yes_id, no_id, user_text):
+    import torch
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        logits = model(**inputs).logits[0, -1]
+    pair = torch.stack([logits[yes_id], logits[no_id]])
+    return torch.softmax(pair.float(), dim=0)[0].item(), \
+        inputs["input_ids"].shape[1]
+
+
+def auroc(y, p):
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(y, p)
+
+
+def paired_bootstrap(y, preds_by_cond, n_boot, seed):
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    boot = {c: [] for c in preds_by_cond}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yb = y[idx]
+        if yb.sum() == 0 or yb.sum() == n:
+            continue
+        for c, p in preds_by_cond.items():
+            boot[c].append(auroc(yb, p[idx]))
+    return {c: np.array(v) for c, v in boot.items()}
+
+
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    baseline_name = f"baseline_{budget_tag(args.base_budget)}"
+
+    jsonl_stays = load_jsonl_stays(args)
+    wanted = load_cohort(args, jsonl_stays)
+
+    icu = pd.read_csv(args.icustays, usecols=["stay_id", "intime"],
+                      parse_dates=["intime"])
+    labels_map = pd.read_csv(args.d_items, usecols=["itemid", "label"]) \
+                   .set_index("itemid")["label"].to_dict()
+
+    ev = get_events(args, wanted)
+    ev["charttime"] = pd.to_datetime(ev["charttime"])
+    ev = ev.merge(icu, on="stay_id", how="left")
+    ev["hours"] = (ev["charttime"] - ev["intime"]).dt.total_seconds() / 3600.0
+    ev = ev[(ev["hours"] >= 0) & (ev["hours"] <= args.prediction_hours)]
+
+    from transformers import AutoTokenizer
+    tokenizer_only = AutoTokenizer.from_pretrained(args.model_name)
+
+    def ntok(t):
+        return len(tokenizer_only(t, add_special_tokens=False).input_ids)
+
+    print("Serializing and tokenizing stays ...")
+    stay_data = {}
+    for sid, g in ev.groupby("stay_id"):
+        lines = serialize_lines(g, labels_map)
+        if not lines:
+            continue
+        per_line = np.array([ntok(l) + 1 for l in lines])
+        s = jsonl_stays.get(sid, {})
+        stay_data[sid] = {
+            "lines": lines, "per_line": per_line,
+            "summary": s.get("patient_summary_text", ""),
+            "label": s.get("labels", {}).get(args.label_key),
+        }
+    stay_data = {sid: d for sid, d in stay_data.items()
+                 if d["label"] is not None}
+    print(f"{len(stay_data)} stays with events and labels")
+
+    # Frozen clinical content: same suffix construction as Experiment 2
+    for sid, d in stay_data.items():
+        cum_rev = np.cumsum(d["per_line"][::-1])
+        k = int(np.searchsorted(cum_rev, args.base_budget, side="right"))
+        d["base_lines"] = d["lines"][len(d["lines"]) - k:]
+        d["base_tokens"] = int(cum_rev[k - 1]) if k else 0
+
+    # Filler pool: (line, tokens, source_stay) from all cohort stays
+    pool = []
+    for sid, d in stay_data.items():
+        for line, t in zip(d["lines"], d["per_line"]):
+            pool.append((line, int(t), sid))
+    pool_tokens = sum(t for _, t, _ in pool)
+    print(f"Filler pool: {len(pool)} lines, {pool_tokens} tokens")
+    if args.pad_budgets and pool_tokens < max(args.pad_budgets) * 1.2:
+        print(f"WARNING: pool holds {pool_tokens} tokens; after excluding a "
+              f"stay's own lines it may not reach {max(args.pad_budgets)}. "
+              f"Raise --n-samples or lower --pad-budgets.")
+
+    header_tokens = ntok(FILLER_HEADER)
+
+    def build_filler(sid, n_tokens):
+        """Deterministic filler for this stay, excluding its own lines.
+        Longer fillers strictly extend shorter ones (prefix property)."""
+        if n_tokens <= 0:
+            return ""
+        rng = np.random.default_rng(args.seed + sid)
+        order = rng.permutation(len(pool))
+        lines, used = [], header_tokens
+        for j in order:
+            line, t, src = pool[j]
+            if src == sid:
+                continue
+            if used + t > n_tokens:
+                break
+            lines.append(line)
+            used += t
+        return FILLER_HEADER + "\n".join(lines)
+
+    # Conditions
+    conditions = [(baseline_name, None, None)]
+    for b in args.pad_budgets:
+        conditions.append((f"{budget_tag(b)}_after", b, "after"))
+        conditions.append((f"{budget_tag(b)}_before", b, "before"))
+
+    model, processor, tokenizer, yes_id, no_id = load_model(args.model_name)
+
+    rows = []
+    sids = sorted(stay_data)
+    for i, sid in enumerate(sids):
+        d = stay_data[sid]
+        record = ("PATIENT RECORD (this patient, chronological, most recent "
+                  "last):\n" + "\n".join(d["base_lines"]))
+        # cache fillers per stay so before/after at the same budget share text
+        fillers = {b: build_filler(sid, b - d["base_tokens"])
+                   for b in args.pad_budgets}
+        for name, b, placement in conditions:
+            if placement is None:
+                body = record
+            elif placement == "after":
+                body = record + "\n\n" + fillers[b]
+            else:
+                body = fillers[b] + "\n\n" + record
+            user_text = ("PATIENT SUMMARY:\n" + d["summary"] + "\n\n" +
+                         body + QUESTION)
+            p, n_in = score_mortality(model, processor, yes_id, no_id,
+                                      user_text)
+            rows.append({"stay_id": sid, "condition": name,
+                         "p_death": p, "label": d["label"],
+                         "base_tokens": d["base_tokens"],
+                         "input_tokens": n_in})
+        if (i + 1) % 10 == 0:
+            print(f"  {i + 1}/{len(sids)} stays scored")
+            pd.DataFrame(rows).to_csv(out / "predictions.csv", index=False)
+
+    preds = pd.DataFrame(rows)
+    preds.to_csv(out / "predictions.csv", index=False)
+
+    # Metrics
+    wide = preds.pivot(index="stay_id", columns="condition",
+                       values="p_death")
+    y = preds.groupby("stay_id")["label"].first().loc[wide.index].to_numpy()
+    cond_names = [c[0] for c in conditions]
+    preds_by_cond = {c: wide[c].to_numpy() for c in cond_names}
+
+    boot = paired_bootstrap(y, preds_by_cond, args.n_bootstrap, args.seed)
+    table = []
+    for c in cond_names:
+        point = auroc(y, preds_by_cond[c])
+        lo, hi = np.percentile(boot[c], [2.5, 97.5])
+        delta = boot[c] - boot[baseline_name]
+        dlo, dhi = np.percentile(delta, [2.5, 97.5])
+        table.append({"condition": c, "auroc": round(point, 4),
+                      "ci_lo": round(lo, 4), "ci_hi": round(hi, 4),
+                      "delta_vs_baseline": round(delta.mean(), 4),
+                      "delta_ci_lo": round(dlo, 4),
+                      "delta_ci_hi": round(dhi, 4)})
+    res = pd.DataFrame(table)
+    res.to_csv(out / "auroc_by_condition.csv", index=False)
+    print("\n", res.to_string(index=False))
+
+    # positional effect: before minus after at each budget
+    with open(out / "positional_effect.txt", "w") as f:
+        for b in args.pad_budgets:
+            d_pos = (boot[f"{budget_tag(b)}_before"] -
+                     boot[f"{budget_tag(b)}_after"])
+            f.write(f"{budget_tag(b)}: before-after AUROC = "
+                    f"{d_pos.mean():+.4f} "
+                    f"(95% CI {np.percentile(d_pos, 2.5):+.4f}, "
+                    f"{np.percentile(d_pos, 97.5):+.4f})\n")
+    print(open(out / "positional_effect.txt").read())
+
+    # Plot
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(5.5, 4))
+    x = np.array(args.pad_budgets)
+    base = res.loc[res.condition == baseline_name, "auroc"].item()
+    ax.axhline(base, color="black", ls="--", lw=1,
+               label=f"baseline {budget_tag(args.base_budget)} ({base:.3f})")
+    for placement, marker in [("after", "o"), ("before", "s")]:
+        names = [f"{budget_tag(b)}_{placement}" for b in args.pad_budgets]
+        sub = res.set_index("condition").loc[names]
+        yv = sub["auroc"].to_numpy()
+        ax.errorbar(x, yv,
+                    yerr=[yv - sub["ci_lo"], sub["ci_hi"] - yv],
+                    marker=marker, capsize=3, label=f"filler {placement}")
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels([budget_tag(b) for b in args.pad_budgets])
+    ax.set_xlabel(f"Total event tokens (content fixed at "
+                  f"{budget_tag(args.base_budget)})")
+    ax.set_ylabel("AUROC")
+    ax.set_title(f"Padding control, n={len(y)} stays")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out / "padding.png", dpi=200)
+    print(f"\nDone. Outputs in {out}/")
+
+
+if __name__ == "__main__":
+    main()
